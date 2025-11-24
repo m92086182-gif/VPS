@@ -23,7 +23,9 @@ jobs:
             ufw \
             python3 \
             python3-pip \
-            jq
+            jq \
+            iputils-ping \
+            netcat-openbsd
 
       - name: Configure SSH Server
         run: |
@@ -149,18 +151,48 @@ jobs:
       - name: Verify Connectivity
         run: |
           echo "🔍 Testing connectivity..."
-          sudo apt-get install -y netcat
           
-          # Test Tailscale IP connectivity
-          ping -c 3 ${{ env.TAILSCALE_IP }} && echo "✅ Ping successful" || echo "⚠️ Ping failed"
+          # Test Tailscale IP connectivity using ping
+          echo "Testing ping to Tailscale IP..."
+          if ping -c 3 ${{ env.TAILSCALE_IP }} > /dev/null 2>&1; then
+            echo "✅ Ping successful"
+          else
+            echo "⚠️ Ping failed - this might be normal for some Tailscale configurations"
+          fi
           
-          # Test SSH port
+          # Test SSH port using multiple methods
+          echo "Testing SSH port 22..."
+          
+          # Method 1: Using nc (netcat-openbsd)
+          if command -v nc > /dev/null; then
+            echo "Using netcat to test SSH port..."
+            timeout 30s bash -c "
+              until nc -z -w 1 ${{ env.TAILSCALE_IP }} 22; do
+                echo 'Waiting for SSH port...'
+                sleep 3
+              done
+            " && echo "✅ SSH port is open (netcat)" || echo "⚠️ SSH port check timeout (netcat)"
+          else
+            echo "❌ netcat not available"
+          fi
+          
+          # Method 2: Using bash built-in
+          echo "Using bash to test SSH port..."
           timeout 30s bash -c "
-            until nc -z ${{ env.TAILSCALE_IP }} 22; do
-              echo 'Waiting for SSH...'
+            until { echo > /dev/tcp/${{ env.TAILSCALE_IP }}/22; } 2>/dev/null; do
+              echo 'Waiting for SSH port...'
               sleep 3
             done
-          " && echo "✅ SSH port open" || echo "⚠️ SSH port check timeout"
+          " && echo "✅ SSH port is open (bash)" || echo "⚠️ SSH port check timeout (bash)"
+          
+          # Method 3: Using telnet (if available)
+          if command -v telnet > /dev/null; then
+            echo "Using telnet to test SSH port..."
+            echo "quit" | timeout 10 telnet ${{ env.TAILSCALE_IP }} 22 | grep -q "Connected" && \
+            echo "✅ SSH port is open (telnet)" || echo "⚠️ SSH port not accessible (telnet)"
+          fi
+          
+          echo "Connectivity tests completed"
 
       - name: Display Connection Info
         run: |
@@ -180,6 +212,12 @@ jobs:
           echo "RAM: $(free -h | grep Mem | awk '{print $2}')"
           echo "Disk: $(df -h / | awk 'NR==2 {print $2}')"
           echo ""
+          echo "🔧 Installed Tools:"
+          echo "Node.js: $(node --version 2>/dev/null || echo 'Not available')"
+          echo "Docker: $(docker --version 2>/dev/null || echo 'Not available')"
+          echo "Docker Compose: $(docker-compose --version 2>/dev/null || echo 'Not available')"
+          echo "Python3: $(python3 --version 2>/dev/null || echo 'Not available')"
+          echo ""
 
       - name: Keep VPS Active
         run: |
@@ -198,6 +236,7 @@ jobs:
             
             # Quick service status
             echo "Services: SSH($(sudo systemctl is-active ssh)), Docker($(sudo systemctl is-active docker))"
+            echo "Tailscale: $(sudo tailscale status --active 2>/dev/null && echo 'Active' || echo 'Inactive')"
             
             sleep 30
             counter=$((counter + 1))
