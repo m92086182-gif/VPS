@@ -1,285 +1,149 @@
-name: Linux VPS Setup
+name: RDP Windows Server
+
 on:
   workflow_dispatch:
 
 jobs:
-  secure-vps:
-    runs-on: ubuntu-latest
+  secure-rdp:
+    runs-on: windows-2022
     timeout-minutes: 3600
 
     steps:
-      - name: Update System and Install Essential Packages
+      - name: Configure RDP on Windows Server
         run: |
-          sudo apt-get update
-          sudo apt-get upgrade -y
-          sudo apt-get install -y \
-            curl \
-            wget \
-            git \
-            build-essential \
-            htop \
-            net-tools \
-            openssh-server \
-            ufw \
-            python3 \
-            python3-pip \
-            jq \
-            iputils-ping \
-            netcat-openbsd \
-            telnet
+          # Enable Remote Desktop (قد يكون مفعلاً مسبقاً في السيرفر)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # تعطيل مصادقة مستوى الشبكة للتوافق
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Configure SSH Server
-        run: |
-          sudo systemctl enable ssh || true
-          sudo systemctl start ssh || true
-          
-          # Backup original sshd_config
-          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-          
-          # Configure SSH settings
-          sudo sed -i 's/#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-          
-          sudo systemctl restart ssh || true
-          echo "✅ SSH configured successfully"
+          # إعداد جدار الحماية
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-      - name: Create Admin User with Root Privileges
-        run: |
-          # Generate secure random password
-          PASSWORD=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-20)
-          USERNAME="vpsadmin"
-          
-          # Remove existing user if any
-          if id "$USERNAME" &>/dev/null; then
-            echo "Removing existing user $USERNAME..."
-            sudo userdel -r "$USERNAME" 2>/dev/null || true
-            sleep 2
-          fi
-          
-          # Create new user
-          echo "Creating user $USERNAME..."
-          sudo useradd -m -s /bin/bash "$USERNAME" || {
-            echo "Failed to create user, trying with different approach..."
-            sudo adduser --disabled-password --gecos "" "$USERNAME" || exit 1
-          }
-          
-          echo "$USERNAME:$PASSWORD" | sudo chpasswd
-          sudo usermod -aG sudo "$USERNAME"
-          
-          # Configure sudo without password
-          echo "$USERNAME ALL=(ALL:ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/"$USERNAME"
-          sudo chmod 440 /etc/sudoers.d/"$USERNAME"
-          
-          echo "VPS_CREDS=Username: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
-          echo "VPS_USERNAME=$USERNAME" >> $GITHUB_ENV
-          echo "VPS_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-          echo "✅ User $USERNAME created successfully"
+          # إعادة تشغيل خدمة RDP
+          Restart-Service -Name TermService -Force
+          Start-Service -Name SessionEnv -ErrorAction SilentlyContinue
 
-      - name: Configure Firewall
+      - name: Create RDP User with Secure Password
         run: |
-          echo "Configuring firewall..."
-          sudo ufw --force reset || true
-          sudo ufw allow ssh || true
-          sudo ufw allow 22/tcp || true
-          echo "y" | sudo ufw enable || true
-          sudo ufw status verbose || true
-          echo "✅ Firewall configured"
-
-      - name: Install Tailscale with Enhanced Error Handling
-        run: |
-          set -e  # Exit on any error
-          
-          echo "Installing Tailscale..."
-          curl -fsSL https://tailscale.com/install.sh | sh || {
-            echo "❌ Tailscale installation failed"
-            exit 1
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
           }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          echo "✅ Tailscale installed successfully"
+          # إنشاء المستخدم وإضافته للمجموعات
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
           
-          # Validate auth key
-          AUTH_KEY="${{ secrets.TAILSCALE_AUTH_KEY }}"
-          if [ -z "$AUTH_KEY" ]; then
-            echo "❌ ERROR: Tailscale auth key is empty"
-            echo "Please set TAILSCALE_AUTH_KEY in GitHub Secrets"
-            exit 1
-          fi
+          # تمكين حساب المستخدم
+          Enable-LocalUser -Name "RDPUser"
           
-          if [[ ! "$AUTH_KEY" =~ ^tskey-[a-zA-Z0-9]+ ]]; then
-            echo "❌ ERROR: Invalid Tailscale auth key format"
-            echo "Key should start with 'tskey-'"
-            exit 1
-          fi
+          echo "RDP_CREDS=User: RDPUser | Password: $password" >> $env:GITHUB_ENV
           
-          echo "🔑 Auth key validation passed"
-          
-          # Start Tailscale
-          echo "Starting Tailscale..."
-          sudo tailscale up --authkey="$AUTH_KEY" --hostname=gh-vps-${{ github.run_id }} --accept-routes --accept-dns || {
-            echo "❌ Tailscale startup failed"
-            echo "Debug info:"
-            sudo tailscale status || true
-            exit 1
-          }
-          
-          # Wait for IP assignment
-          echo "Waiting for Tailscale IP..."
-          TS_IP=""
-          for i in {1..30}; do
-            TS_IP=$(sudo tailscale ip -4 2>/dev/null || echo "")
-            if [ -n "$TS_IP" ]; then
-              echo "✅ Tailscale IP assigned: $TS_IP"
-              break
-            fi
-            echo "⏳ Attempt $i/30 - Waiting for IP..."
-            sleep 5
-          done
-          
-          if [ -z "$TS_IP" ]; then
-            echo "❌ Failed to get Tailscale IP after 30 attempts"
-            echo "Debug info:"
-            sudo tailscale status || true
-            sudo tailscale netcheck || true
-            exit 1
-          fi
-          
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-          echo "Final Tailscale status:"
-          sudo tailscale status || true
-
-      - name: Install Development Tools
-        run: |
-          set -e
-          
-          echo "Installing Node.js..."
-          curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && \
-          sudo apt-get install -y nodejs && \
-          echo "✅ Node.js $(node --version) installed" || {
-            echo "⚠️ Node.js installation had issues, continuing..."
-          }
-          
-          echo "Installing Docker..."
-          curl -fsSL https://get.docker.com | sh && \
-          sudo usermod -aG docker $USER && \
-          sudo usermod -aG docker vpsadmin && \
-          sudo systemctl enable docker && \
-          sudo systemctl start docker && \
-          echo "✅ Docker installed" || {
-            echo "⚠️ Docker installation had issues, continuing..."
-          }
-          
-          echo "Installing Docker Compose..."
-          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose && \
-          sudo chmod +x /usr/local/bin/docker-compose && \
-          echo "✅ Docker Compose installed" || {
-            echo "⚠️ Docker Compose installation had issues, continuing..."
+          # التحقق من إنشاء المستخدم
+          if (-not (Get-LocalUser -Name "RDPUser")) {
+              Write-Error "فشل في إنشاء المستخدم"
+              exit 1
           }
 
-      - name: System Optimization
+      - name: Install Tailscale
         run: |
-          echo "Optimizing system settings..."
-          echo "fs.inotify.max_user_watches=524288" | sudo tee -a /etc/sysctl.conf
-          echo "fs.inotify.max_user_instances=512" | sudo tee -a /etc/sysctl.conf
-          sudo sysctl -p || true
-          sudo timedatectl set-timezone UTC || true
-          echo "✅ System optimized"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      - name: Enhanced Connectivity Test
+      - name: Establish Tailscale Connection
         run: |
-          echo "🔍 Starting connectivity tests..."
+          # الانتظار حتى تكون خدمة Tailscale جاهزة
+          Start-Sleep -Seconds 10
           
-          # Check if Tailscale IP is set
-          if [ -z "${{ env.TAILSCALE_IP }}" ]; then
-            echo "❌ TAILSCALE_IP is not set"
-            exit 1
-          fi
+          # تشغيل Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=win-server-$env:GITHUB_RUN_ID
           
-          echo "Testing connection to: ${{ env.TAILSCALE_IP }}"
+          # الانتظار للحصول على IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 5
+                  $retries++
+              }
+          }
           
-          # Test basic connectivity
-          echo "1. Testing basic connectivity..."
-          if ping -c 2 -W 1 "${{ env.TAILSCALE_IP }}" > /dev/null 2>&1; then
-            echo "✅ Basic connectivity: SUCCESS"
-          else
-            echo "⚠️ Basic connectivity: PING FAILED (may be normal for Tailscale)"
-          fi
-          
-          # Test SSH port with multiple methods
-          echo "2. Testing SSH port (22)..."
-          SSH_SUCCESS=false
-          
-          # Method 1: Using /dev/tcp
-          if timeout 10 bash -c "echo > /dev/tcp/${{ env.TAILSCALE_IP }}/22" 2>/dev/null; then
-            echo "✅ SSH port: OPEN (bash method)"
-            SSH_SUCCESS=true
-          else
-            echo "⚠️ SSH port: bash method failed"
-          fi
-          
-          # Method 2: Using nc
-          if command -v nc > /dev/null; then
-            if timeout 10 nc -z -w 1 "${{ env.TAILSCALE_IP }}" 22; then
-              echo "✅ SSH port: OPEN (netcat method)"
-              SSH_SUCCESS=true
-            else
-              echo "⚠️ SSH port: netcat method failed"
-            fi
-          fi
-          
-          if ! $SSH_SUCCESS; then
-            echo "❌ WARNING: SSH port may not be accessible"
-            echo "This might prevent SSH connections"
-          fi
-          
-          echo "Connectivity tests completed"
+          if (-not $tsIP) {
+              Write-Error "فشل في الحصول على عنوان IP من Tailscale"
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "عنوان Tailscale: $tsIP"
 
-      - name: Display Final Connection Info
+      - name: Verify RDP Accessibility
         run: |
-          echo ""
-          echo "🟢 ===== LINUX VPS READY ====="
-          echo "🌐 Tailscale IP: ${{ env.TAILSCALE_IP }}"
-          echo "👤 Username: ${{ env.VPS_USERNAME }}"
-          echo "🔐 Password: ${{ env.VPS_PASSWORD }}"
-          echo "🔗 SSH Command: ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }}"
-          echo "⏱️  Timeout: 60 minutes"
-          echo "==============================="
-          echo ""
-          echo "💻 System Status:"
-          echo "SSH Service: $(systemctl is-active ssh 2>/dev/null || echo 'unknown')"
-          echo "Tailscale: $(sudo tailscale status --active 2>/dev/null && echo 'Active' || echo 'Inactive')"
-          echo "Docker: $(systemctl is-active docker 2>/dev/null || echo 'unknown')"
-          echo ""
-          echo "🔧 To connect:"
-          echo "1. Ensure you're connected to Tailscale VPN"
-          echo "2. Run: ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }}"
-          echo "3. Use the password above when prompted"
-          echo ""
+          Write-Host "فحص الاتصال على عنوان: $env:TAILSCALE_IP"
+          
+          # فحص الاتصال
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+          if (-not $testResult) {
+              Write-Warning "فشل الفحص الأولي، إعادة المحاولة..."
+              Start-Sleep -Seconds 10
+              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          }
+          
+          if ($testResult.TcpTestSucceeded) {
+              Write-Host "✓ الاتصال بشبكة RDP جاهز!"
+          } else {
+              Write-Error "✗ فشل الاتصال بمنفذ RDP"
+              exit 1
+          }
 
-      - name: Keep VPS Active
+      - name: Display Connection Information
         run: |
-          echo "🚀 VPS is now active and ready!"
-          echo "💡 Use the connection info above to SSH into your VPS"
-          echo "⏰ This session will auto-terminate in 60 minutes"
-          echo "🛑 Cancel this workflow in GitHub Actions to stop immediately"
-          
-          MINUTES_REMAINING=60
-          while [ $MINUTES_REMAINING -gt 0 ]; do
-            echo ""
-            echo "=== [$(date +'%H:%M:%S')] VPS Status ==="
-            echo "IP: ${{ env.TAILSCALE_IP }}"
-            echo "User: ${{ env.VPS_USERNAME }}"
-            echo "Time remaining: ${MINUTES_REMAINING} minutes"
-            echo "SSH: ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }}"
-            echo "======================================"
-            
-            # Check critical services
-            echo "Service Status:"
-            echo "- SSH: $(systemctl is-active ssh 2>/dev/null || echo 'unknown')"
-            echo "- Tailscale: $(sudo tailscale status --active 2>/dev/null && echo 'Active' || echo 'Check')"
-            
-            sleep 60
-            MINUTES_REMAINING=$((MINUTES_REMAINING - 1))
-          done
-          
-          echo "🕒 Time limit reached - VPS session ending"
+          Write-Host ""
+          Write-Host "=" * 50
+          Write-Host "RDP جاهز للاتصال - Windows Server 2022"
+          Write-Host "=" * 50
+          Write-Host "العنوان: $env:TAILSCALE_IP"
+          Write-Host "المستخدم: RDPUser"
+          Write-Host "كلمة المرور: $($env:RDP_CREDS.Split('|')[1].Split(':')[1].Trim())"
+          Write-Host "=" * 50
+          Write-Host ""
+
+      - name: Maintain Active Session
+        run: |
+          Write-Host "الجلسة نشطة - استخدم Cancel في GitHub لإيقاف التشغيل"
+          $counter = 0
+          while ($true) {
+              $counter++
+              Write-Host "[$(Get-Date)] الجلسة نشطة - $counter دقائق مرت"
+              
+              # فحص حالة Tailscale كل 5 دقائق
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Error "فشل في فحص حالة Tailscale"
+                  break
+              }
+              
+              Start-Sleep -Seconds 300
+          }
