@@ -1,0 +1,206 @@
+name: Linux VPS Setup
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Update System and Install Essential Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get upgrade -y
+          sudo apt-get install -y \
+            curl \
+            wget \
+            git \
+            build-essential \
+            htop \
+            net-tools \
+            openssh-server \
+            ufw \
+            python3 \
+            python3-pip \
+            jq
+
+      - name: Configure SSH Server
+        run: |
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          
+          sudo systemctl restart ssh
+          echo "✅ SSH configured successfully"
+
+      - name: Create Admin User with Root Privileges
+        run: |
+          # Generate secure random password
+          PASSWORD=$(openssl rand -base64 24)
+          USERNAME="vpsadmin"
+          
+          # Remove existing user if any
+          if id "$USERNAME" &>/dev/null; then
+            sudo userdel -r "$USERNAME" 2>/dev/null || true
+            sleep 2
+          fi
+          
+          # Create new user
+          sudo useradd -m -s /bin/bash -G sudo "$USERNAME"
+          echo "$USERNAME:$PASSWORD" | sudo chpasswd
+          
+          # Configure sudo without password
+          echo "$USERNAME ALL=(ALL:ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/"$USERNAME"
+          sudo chmod 440 /etc/sudoers.d/"$USERNAME"
+          
+          echo "VPS_CREDS=Username: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
+          echo "VPS_USERNAME=$USERNAME" >> $GITHUB_ENV
+          echo "VPS_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+          echo "✅ User $USERNAME created successfully"
+
+      - name: Configure Firewall
+        run: |
+          sudo ufw --force reset
+          sudo ufw allow ssh
+          sudo ufw allow 22/tcp
+          echo "y" | sudo ufw enable
+          sudo ufw status verbose
+          echo "✅ Firewall configured"
+
+      - name: Install Tailscale with Validation
+        run: |
+          # Install Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+          echo "✅ Tailscale installed"
+          
+          # Validate auth key format (basic check)
+          AUTH_KEY="${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if [ -z "$AUTH_KEY" ]; then
+            echo "❌ Tailscale auth key is empty"
+            exit 1
+          fi
+          
+          if [[ ${#AUTH_KEY} -lt 10 ]]; then
+            echo "❌ Tailscale auth key seems too short"
+            exit 1
+          fi
+          
+          echo "🔑 Auth key format validation passed"
+          
+          # Start Tailscale with the auth key
+          sudo tailscale up --authkey="$AUTH_KEY" --hostname=gh-vps-${{ github.run_id }}-${{ github.run_attempt }} --accept-routes --accept-dns
+          
+          # Wait for IP assignment with better error handling
+          TS_IP=""
+          for i in {1..20}; do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null || echo "")
+            if [ -n "$TS_IP" ]; then
+              echo "✅ Tailscale IP assigned: $TS_IP"
+              break
+            fi
+            echo "⏳ Waiting for Tailscale IP... ($i/20)"
+            sleep 5
+          done
+          
+          if [ -z "$TS_IP" ]; then
+            echo "❌ Failed to get Tailscale IP after 20 attempts"
+            echo "Debug info:"
+            sudo tailscale status
+            exit 1
+          fi
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "Final Tailscale status:"
+          sudo tailscale status
+
+      - name: Install Development Tools
+        run: |
+          # Install Node.js
+          curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+          echo "✅ Node.js $(node --version) installed"
+          
+          # Install Docker
+          curl -fsSL https://get.docker.com | sh
+          sudo usermod -aG docker $USER
+          sudo usermod -aG docker vpsadmin
+          sudo systemctl enable docker
+          sudo systemctl start docker
+          echo "✅ Docker $(docker --version) installed"
+          
+          # Install Docker Compose
+          DOCKER_COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | jq -r .tag_name)
+          sudo curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+          echo "✅ Docker Compose installed"
+
+      - name: System Optimization
+        run: |
+          echo "fs.inotify.max_user_watches=524288" | sudo tee -a /etc/sysctl.conf
+          echo "fs.inotify.max_user_instances=512" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+          sudo timedatectl set-timezone UTC
+          echo "✅ System optimized"
+
+      - name: Verify Connectivity
+        run: |
+          echo "🔍 Testing connectivity..."
+          sudo apt-get install -y netcat
+          
+          # Test Tailscale IP connectivity
+          ping -c 3 ${{ env.TAILSCALE_IP }} && echo "✅ Ping successful" || echo "⚠️ Ping failed"
+          
+          # Test SSH port
+          timeout 30s bash -c "
+            until nc -z ${{ env.TAILSCALE_IP }} 22; do
+              echo 'Waiting for SSH...'
+              sleep 3
+            done
+          " && echo "✅ SSH port open" || echo "⚠️ SSH port check timeout"
+
+      - name: Display Connection Info
+        run: |
+          echo ""
+          echo "🟢 ===== LINUX VPS READY ====="
+          echo "🌐 Tailscale IP: ${{ env.TAILSCALE_IP }}"
+          echo "👤 Username: ${{ env.VPS_USERNAME }}"
+          echo "🔐 Password: ${{ env.VPS_PASSWORD }}"
+          echo "🔗 SSH Command: ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }}"
+          echo "⏱️  Timeout: 60 minutes"
+          echo "==============================="
+          echo ""
+          echo "💻 System Information:"
+          echo "OS: $(lsb_release -d | cut -f2)"
+          echo "Kernel: $(uname -r)"
+          echo "CPU: $(nproc) cores"
+          echo "RAM: $(free -h | grep Mem | awk '{print $2}')"
+          echo "Disk: $(df -h / | awk 'NR==2 {print $2}')"
+          echo ""
+
+      - name: Keep VPS Active
+        run: |
+          echo "🚀 VPS is now active!"
+          echo "💡 Use the connection info above to SSH into your VPS"
+          echo "⏰ This session will auto-terminate in 60 minutes"
+          echo "🛑 Cancel this workflow to stop immediately"
+          
+          # Display status every 30 seconds
+          counter=0
+          while [ $counter -lt 120 ]; do
+            echo ""
+            echo "[$(date +'%H:%M:%S')] VPS Active - $((120 - counter)) intervals remaining"
+            echo "IP: ${{ env.TAILSCALE_IP }}"
+            echo "SSH: ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }}"
+            
+            # Quick service status
+            echo "Services: SSH($(sudo systemctl is-active ssh)), Docker($(sudo systemctl is-active docker))"
+            
+            sleep 30
+            counter=$((counter + 1))
+          done
+          
+          echo "🕒 Time limit reached - Shutting down"
