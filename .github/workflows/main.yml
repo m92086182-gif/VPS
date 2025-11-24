@@ -9,99 +9,177 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      - name: Configure RDP on Windows Server
+      - name: Configure RDP Settings
         run: |
+          # تمكين RDP وتعطيل مصادقة الشبكة
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          
+          # إعداد جدار الحماية
+          netsh advfirewall firewall delete rule name="RDP" 2>&1 | Out-Null
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          
+          # إعادة تشغيل الخدمات
           Restart-Service -Name TermService -Force
+          Start-Service -Name SessionEnv -ErrorAction SilentlyContinue
+          
+          Write-Host "✓ تم تكوين إعدادات RDP بنجاح"
 
-      - name: Create RDP User with Custom Password
+      - name: Disable Password Complexity and Create User
         run: |
+          # تعطيل متطلبات تعقيد كلمة المرور
+          try {
+              secedit /export /cfg C:\secpol.cfg
+              ((Get-Content C:\secpol.cfg -Raw) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0') | Set-Content C:\secpol.cfg
+              ((Get-Content C:\secpol.cfg -Raw) -replace 'MinimumPasswordLength = 7', 'MinimumPasswordLength = 6') | Set-Content C:\secpol.cfg
+              secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
+              Remove-Item C:\secpol.cfg -Force -ErrorAction SilentlyContinue
+              Write-Host "✓ تم تعطيل متطلبات تعقيد كلمة المرور"
+          } catch {
+              Write-Host "⚠ لم يتم تعطيل متطلبات التعقيد (ممكن تكون معطلة بالفعل)"
+          }
+
+          # إنشاء المستخدم بكلمة المرور المطلوبة
           $password = "01276205280aaa5"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          
+          # حذف المستخدم إذا كان موجوداً مسبقاً
+          $existingUser = Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue
+          if ($existingUser) {
+              Remove-LocalUser -Name "RDPUser"
+              Write-Host "✓ تم حذف المستخدم القديم"
+          }
+          
+          # إنشاء المستخدم الجديد
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires -Description "RDP Access User"
           Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
           Enable-LocalUser -Name "RDPUser"
+          
           echo "RDP_CREDS=User: RDPUser | Password: $password" >> $env:GITHUB_ENV
+          Write-Host "✓ تم إنشاء المستخدم: RDPUser"
+          Write-Host "✓ كلمة المرور: $password"
 
       - name: Install Tailscale
         run: |
+          # تثبيت Tailscale
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          
+          try {
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 30
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
+              Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+              Write-Host "✓ تم تثبيت Tailscale بنجاح"
+          } catch {
+              Write-Host "❌ فشل في تثبيت Tailscale"
+              echo "TAILSCALE_STATUS=FAILED" >> $env:GITHUB_ENV
+          }
+          
           Start-Sleep -Seconds 10
 
-      - name: Establish Tailscale Connection
+      - name: Setup Tailscale Connection
         run: |
-          # الانتظار حتى تبدأ الخدمة
+          # الانتظار لضمان تحميل الخدمة
           Start-Sleep -Seconds 15
           
-          # محاولة الاتصال بمفتاح المصادقة
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=win-server-$env:GITHUB_RUN_ID --accept-routes --accept-dns
-          
-          # الانتظار وفحص الحالة
-          Start-Sleep -Seconds 10
-          
-          # فحص الحالة المفصل
-          Write-Host "=== Tailscale Status ==="
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" ip
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" netcheck
-          
-          # محاولات متعددة للحصول على IP
-          $tsIP = $null
-          for ($i = 1; $i -le 12; $i++) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              if ($tsIP) {
-                  Write-Host "✓ تم الحصول على IP: $tsIP"
-                  break
+          # فحص إذا كان Tailscale مثبت بشكل صحيح
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              Write-Host "✓ Tailscale مثبت بشكل صحيح"
+              
+              # محاولة الاتصال
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=win-server-$env:GITHUB_RUN_ID --accept-routes --accept-dns
+              
+              # الانتظار والحصول على IP
+              $tsIP = $null
+              for ($i = 1; $i -le 15; $i++) {
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  if ($tsIP -and $tsIP -notlike "*error*") {
+                      Write-Host "✓ تم الحصول على عنوان Tailscale: $tsIP"
+                      echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                      break
+                  }
+                  Write-Host "⌛ في انتظار عنوان IP... المحاولة $i"
+                  Start-Sleep -Seconds 5
               }
-              Write-Host "⌛ المحاولة $i - في انتظار IP..."
-              Start-Sleep -Seconds 10
-          }
-          
-          if (-not $tsIP) {
-              Write-Host "❌ فشل في الحصول على IP من Tailscale"
-              Write-Host "🔍 فحص الحالة النهائية:"
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-              exit 1
-          }
-          
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "فحص الاتصال على: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
-          if ($testResult) {
-              Write-Host "✓ RDP جاهز للاتصال!"
+              
+              if (-not $tsIP) {
+                  Write-Host "❌ فشل في الحصول على عنوان Tailscale"
+                  echo "TAILSCALE_IP=FAILED" >> $env:GITHUB_ENV
+              }
           } else {
-              Write-Host "⚠ فشل فحص RDP، لكن الجلسة مستمرة..."
+              Write-Host "❌ Tailscale غير مثبت بشكل صحيح"
+              echo "TAILSCALE_IP=NOT_INSTALLED" >> $env:GITHUB_ENV
           }
 
-      - name: Display Connection Info
+      - name: Verify RDP Setup
         run: |
-          Write-Host ""
-          Write-Host "=" * 50
-          Write-Host "RDP جاهز للاتصال"
-          Write-Host "=" * 50
-          Write-Host "العنوان: $env:TAILSCALE_IP"
-          Write-Host "المستخدم: RDPUser"
+          # فحص حالة RDP
+          $rdpEnabled = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections").fDenyTSConnections
+          $userExists = Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue
+          
+          Write-Host "=== فحص الإعدادات ==="
+          Write-Host "RDP مفعل: $(if ($rdpEnabled -eq 0) { 'نعم' } else { 'لا' })"
+          Write-Host "المستخدم موجود: $(if ($userExists) { 'نعم' } else { 'لا' })"
           Write-Host "كلمة المرور: 01276205280aaa5"
-          Write-Host "=" * 50
+          
+          if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -notin @('FAILED', 'NOT_INSTALLED')) {
+              Write-Host "عنوان Tailscale: $env:TAILSCALE_IP"
+              
+              # فحص الاتصال
+              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue
+              Write-Host "الاتصال بشبكة RDP: $(if ($testResult) { 'ناجح' } else { 'فاشل' })"
+          } else {
+              Write-Host "❌ لا يوجد اتصال Tailscale نشط"
+          }
+          Write-Host "===================="
+
+      - name: Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "=" * 60
+          Write-Host "🎯 RDP WINDOWS SERVER 2022 - جاهز للاتصال"
+          Write-Host "=" * 60
+          Write-Host "👤 المستخدم: RDPUser"
+          Write-Host "🔑 كلمة المرور: 01276205280aaa5"
+          
+          if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -notin @('FAILED', 'NOT_INSTALLED')) {
+              Write-Host "🌐 العنوان: $env:TAILSCALE_IP"
+              Write-Host "📍 الطريقة: استخدم Tailscale VPN للاتصال"
+          } else {
+              Write-Host "🌐 العنوان: استخدم عنوان الـ Runner مباشرة"
+              Write-Host "📍 الطريقة: اتصال مباشر (قد يحتاج إعدادات شبكة)"
+          }
+          
+          Write-Host "⏰ المدة: 6 ساعات كحد أقصى"
+          Write-Host "⚡ الحالة: نشط وجاهز"
+          Write-Host "=" * 60
           Write-Host ""
 
-      - name: Maintain Session
+      - name: Maintain Active Session
         run: |
-          $minutes = 0
-          while ($minutes -lt 350) {
-              Write-Host "[$(Get-Date)] الجلسة نشطة - $minutes دقيقة من 355"
-              Start-Sleep -Seconds 60
-              $minutes++
+          Write-Host "🚀 بدء الجلسة - الرجاء عدم إغلاق هذا التنفيذ"
+          Write-Host "⏳ المدة المتبقية: 5 ساعات و55 دقيقة"
+          
+          $startTime = Get-Date
+          $checkInterval = 60 # ثانية
+          
+          for ($minute = 1; $minute -le 355; $minute++) {
+              $elapsed = (Get-Date) - $startTime
+              $remaining = New-TimeSpan -Minutes (355 - $minute)
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ⏰ $minute/355 دقيقة - متبقي: $($remaining.ToString('hh\:mm'))"
+              
+              # فحص حالة الخدمات كل 5 دقائق
+              if ($minute % 5 -eq 0) {
+                  $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+                  $tsService = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+                  
+                  Write-Host "   🔍 فحص الخدمات - RDP: $($rdpService.Status) | Tailscale: $(if ($tsService) { $tsService.Status } else { 'Not Found' })"
+              }
+              
+              Start-Sleep -Seconds $checkInterval
           }
-          Write-Host "⏰ انتهت المدة تقريباً"
+          
+          Write-Host "🛑 انتهت المدة - إغلاق الجلسة"
